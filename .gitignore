@@ -1,1 +1,19 @@
-.vscode
+# IDE & OS
+.vscode/
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Testing & Notebooks
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Benchmark outputs & XProf traces
+results/

@@ -1,0 +1,19 @@
+# Note: On Cloud TPU VMs, install the TorchTPU build (`torch`) and TPU-enabled
+# `jax[tpu]` from the TPU/sprint wheel index first so pip does not replace them
+# with CPU-only PyPI wheels.
+
+# Core numerical & geospatial I/O
+numpy>=1.26.0,<3.0.0
+rasterio>=1.3.10
+
+# Testing
+pytest>=8.0.0
+
+# Profiling (XProf / TensorBoard)
+tensorboard>=2.16.0
+tensorboard-plugin-profile>=2.16.0
+
+# Plotting & tutorial notebook
+matplotlib>=3.8.0
+pandas>=2.2.0
+jupyterlab>=4.1.0
