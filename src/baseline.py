@@ -1,6 +1,11 @@
 from typing import Tuple
 import torch
 
+try:
+    import torch_tpu  # noqa: F401
+except ImportError:
+    pass
+
 
 def compute_indices_eager(red: torch.Tensor,green: torch.Tensor,nir: torch.Tensor,eps: float = 1e-6,) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute NDVI and NDWI using standard PyTorch ops on TPU.

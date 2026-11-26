@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch_tpu  # noqa: F401
 
 from src.baseline import compute_indices_eager, get_compiled_indices_fn
 from src.pallas_kernel import compute_indices_pallas

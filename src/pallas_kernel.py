@@ -4,20 +4,23 @@ from typing import Tuple
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 import torch
-import torch.nn.functional as F
-
-# TorchTPU Pallas bridge
-from torch.tpu import pallas as tpu_pallas
+import torch_tpu  # Registers the native 'tpu' backend and torch.tpu.pallas
 
 
-_TORCH_TO_JAX_DTYPE = {
-    torch.float32: jnp.float32,
-    torch.bfloat16: jnp.bfloat16,
-}
+_SUPPORTED_DTYPES = (torch.float32, torch.bfloat16)
 
 
-def _fused_spectral_indices_2d_kernel(red_ref,green_ref,nir_ref,out_ndvi_ref,out_ndwi_ref, *,eps: float,):
+def _fused_spectral_indices_2d_kernel(
+    red_ref,
+    green_ref,
+    nir_ref,
+    out_ndvi_ref,
+    out_ndwi_ref,
+    *,
+    eps: float,
+):
     """Pallas kernel operating on 2D tiles inside TPU VMEM (SRAM)."""
     red = red_ref[...]
     green = green_ref[...]
@@ -37,21 +40,60 @@ def _fused_spectral_indices_2d_kernel(red_ref,green_ref,nir_ref,out_ndvi_ref,out
     out_ndwi_ref[...] = ndwi.astype(orig_dtype)
 
 
-def _pad_to_block_multiple(tensor: torch.Tensor, block_h: int, block_w: int,) -> Tuple[torch.Tensor, Tuple[int, int]]:
-    """Pad a 2D tensor on the bottom/right so dimensions are multiples of block size."""
-    h, w  = tensor.shape
-    pad_h = (block_h - (h % block_h)) % block_h
-    pad_w = (block_w - (w % block_w)) % block_w
+@torch.tpu.pallas.jax_op("spectral::fused_ndvi_ndwi")
+def _fused_spectral_indices_op(
+    red: jax.Array,
+    green: jax.Array,
+    nir: jax.Array,
+    block_h: int = 512,
+    block_w: int = 512,
+    eps: float = 1e-6,
+) -> tuple[jax.Array, jax.Array]:
+    """TorchTPU custom op wrapping the 2D-tiled Pallas spectral index kernel.
 
-    if pad_h == 0 and pad_w == 0:
-        return tensor, (0, 0)
+    Uses `pl.cdiv` so Mosaic TPU handles non-multiple spatial dimensions
+    (such as Sentinel-2 10980x10980 tiles) directly on boundary DMAs without
+    allocating extra padded HBM tensors.
+    """
+    h, w = red.shape
+    grid = (pl.cdiv(h, block_h), pl.cdiv(w, block_w))
 
-    # F.pad expects (pad_left, pad_right, pad_top, pad_bottom)
-    padded = F.pad(tensor, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
-    return padded, (pad_h, pad_w)
+    out_shape = (
+        jax.ShapeDtypeStruct((h, w), red.dtype),
+        jax.ShapeDtypeStruct((h, w), red.dtype),
+    )
+
+    block_spec = pl.BlockSpec(
+        block_shape=(block_h, block_w),
+        index_map=lambda i, j: (i, j),
+    )
+
+    kernel_fn = functools.partial(_fused_spectral_indices_2d_kernel, eps=eps)
+    compiler_params = (
+        pltpu.CompilerParams(dimension_semantics=("parallel", "parallel"))
+        if hasattr(pltpu, "CompilerParams")
+        else None
+    )
+
+    ndvi_out, ndwi_out = pl.pallas_call(
+        kernel_fn,
+        out_shape=out_shape,
+        in_specs=[block_spec, block_spec, block_spec],
+        out_specs=(block_spec, block_spec),
+        grid=grid,
+        compiler_params=compiler_params,
+    )(red, green, nir)
+
+    return ndvi_out, ndwi_out
 
 
-def compute_indices_pallas(red: torch.Tensor,green: torch.Tensor,nir: torch.Tensor,block_shape: Tuple[int, int] = (128, 128),eps: float = 1e-6,) -> Tuple[torch.Tensor, torch.Tensor]:
+def compute_indices_pallas(
+    red: torch.Tensor,
+    green: torch.Tensor,
+    nir: torch.Tensor,
+    block_shape: Tuple[int, int] = (512, 512),
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute fused NDVI and NDWI on TPU using a 2D-tiled Pallas kernel.
 
     Args:
@@ -69,48 +111,16 @@ def compute_indices_pallas(red: torch.Tensor,green: torch.Tensor,nir: torch.Tens
         raise ValueError("All input bands must be 2D tensors of shape (H, W).")
     if not (red.shape == green.shape == nir.shape):
         raise ValueError("All input bands must have identical shapes.")
-    if red.dtype not in _TORCH_TO_JAX_DTYPE:
+    if red.dtype not in _SUPPORTED_DTYPES:
         raise TypeError(
-            f"Unsupported dtype {red.dtype}. Supported: {list(_TORCH_TO_JAX_DTYPE.keys())}"
+            f"Unsupported dtype {red.dtype}. Supported: {list(_SUPPORTED_DTYPES)}"
         )
 
-    orig_h, orig_w   = red.shape
     block_h, block_w = block_shape
 
     # Ensure contiguity to avoid expensive view relayouts on TPU
-    red_c, _   = _pad_to_block_multiple(red.contiguous(), block_h, block_w)
-    green_c, _ = _pad_to_block_multiple(green.contiguous(), block_h, block_w)
-    nir_c, _   = _pad_to_block_multiple(nir.contiguous(), block_h, block_w)
+    red_c = red.contiguous()
+    green_c = green.contiguous()
+    nir_c = nir.contiguous()
 
-    padded_h, padded_w = red_c.shape
-    grid = (padded_h // block_h, padded_w // block_w)
-
-    jax_dtype = _TORCH_TO_JAX_DTYPE[red.dtype]
-    out_shape = [
-        jax.ShapeDtypeStruct((padded_h, padded_w), jax_dtype),
-        jax.ShapeDtypeStruct((padded_h, padded_w), jax_dtype),
-    ]
-
-    block_spec = pl.BlockSpec(
-        block_shape=(block_h, block_w),
-        index_map=lambda i, j: (i, j),
-    )
-
-    kernel_fn = functools.partial(_fused_spectral_indices_2d_kernel, eps=eps)
-
-    fused_call = tpu_pallas.pallas_call(
-        kernel_fn,
-        out_shape=out_shape,
-        in_specs=[block_spec, block_spec, block_spec],
-        out_specs=[block_spec, block_spec],
-        grid=grid,
-    )
-
-    ndvi_out, ndwi_out = fused_call(red_c, green_c, nir_c)
-
-    # Slice back to original dimensions if padding was applied
-    if padded_h != orig_h or padded_w != orig_w:
-        ndvi_out = ndvi_out[:orig_h, :orig_w]
-        ndwi_out = ndwi_out[:orig_h, :orig_w]
-
-    return ndvi_out, ndwi_out
+    return _fused_spectral_indices_op(red_c, green_c, nir_c, block_h, block_w, eps)

@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Callable, List, Tuple
 
 import torch
+import torch_tpu  # noqa: F401
 from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 from src.baseline import compute_indices_eager, get_compiled_indices_fn
